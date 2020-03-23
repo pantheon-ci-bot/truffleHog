@@ -42,6 +42,8 @@ def main():
     parser.add_argument("--repo_path", type=str, dest="repo_path", help="Path to the cloned repo. If provided, git_url will not be used")
     parser.add_argument("--cleanup", dest="cleanup", action="store_true", help="Clean up all temporary result files")
     parser.add_argument("--skip_fs", dest="skip_fs", action="store_true", help="Do not write issues to the filesystem")
+    parser.add_argument("--skip_fetch", dest="skip_fetch", action="store_true", help='Scan local branches. If this is '
+                             'left out, a git fetch will happen, and only changed branches will be scanned')
     parser.add_argument('git_url', type=str, help='URL for secret searching')
     parser.set_defaults(regex=False)
     parser.set_defaults(rules={})
@@ -52,6 +54,7 @@ def main():
     parser.set_defaults(repo_path=None)
     parser.set_defaults(cleanup=False)
     parser.set_defaults(skip_fs=False)
+    parser.set_defaults(skip_fetch=False)
     args = parser.parse_args()
     rules = {}
     if args.rules:
@@ -82,7 +85,7 @@ def main():
 
     output = find_strings(args.git_url, args.since_commit, args.max_depth, args.output_json, args.do_regex, do_entropy,
             surpress_output=False, branch=args.branch, repo_path=args.repo_path, path_inclusions=path_inclusions,
-            path_exclusions=path_exclusions, skip_fs=args.skip_fs)
+            path_exclusions=path_exclusions, skip_fs=args.skip_fs, skip_fetch=args.skip_fetch)
     project_path = output["project_path"]
     if args.cleanup:
         clean_up(output)
@@ -246,7 +249,7 @@ def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, comm
             regex_matches.append(foundRegex)
     return regex_matches
 
-def diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, path_inclusions, path_exclusions):
+def diff_worker(diff, commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, path_inclusions, path_exclusions):
     issues = []
     for blob in diff:
         printableDiff = blob.diff.decode('utf-8', errors='replace')
@@ -254,15 +257,15 @@ def diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_
             continue
         if not path_included(blob, path_inclusions, path_exclusions):
             continue
-        commit_time =  datetime.datetime.fromtimestamp(prev_commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
+        commit_time =  datetime.datetime.fromtimestamp(commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
         foundIssues = []
+        if do_regex:
+            found_regexes = regex_check(printableDiff, commit_time, branch_name, commit, blob, commitHash, custom_regexes)
+            foundIssues += found_regexes
         if do_entropy:
-            entropicDiff = find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash)
+            entropicDiff = find_entropy(printableDiff, commit_time, branch_name, commit, blob, commitHash)
             if entropicDiff:
                 foundIssues.append(entropicDiff)
-        if do_regex:
-            found_regexes = regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash, custom_regexes)
-            foundIssues += found_regexes
         if not surpress_output:
             for foundIssue in foundIssues:
                 print_results(printJson, foundIssue)
@@ -309,59 +312,81 @@ def path_included(blob, include_patterns=None, exclude_patterns=None):
 
 
 def find_strings(git_url, since_commit=None, max_depth=1000000, printJson=False, do_regex=False, do_entropy=True, surpress_output=True,
-                custom_regexes={}, branch=None, repo_path=None, path_inclusions=None, path_exclusions=None, skip_fs=False):
+                custom_regexes={}, branch=None, repo_path=None, path_inclusions=None, path_exclusions=None, skip_fs=False, skip_fetch=False):
     output = {"foundIssues": []}
     if repo_path:
         project_path = repo_path
     else:
         project_path = clone_git_repo(git_url)
     repo = Repo(project_path)
-    already_searched = set()
+    already_searched = {}
     output_dir = None if skip_fs else tempfile.mkdtemp()
+    
+    first_commit = None
+    # first_commit = 'ff0237d6bcc242cefe66bb3e2d05243b3d966825'
+    # since_commit = 'a42538ff688332b3b8ca75c228d291484e66e4a9'
+    """
+    ff0237d6bcc242cefe66bb3e2d05243b3d966825
+    7d864d70f36c3104451164d9c603a56aeed1ebc8
+    322d87619483978eaa5db17a8700646d5ac30b01
+    e523d4923b8d51d926ce8496453268c1108ed7ef
+    5743e903194666e2b52b4ec3f0bfc64f4a914411
+    b094466f600361d79630447e38cf540bfd6c5341
+    4847930a71fed07e6be071298a85761cf1c2878b
+    a42538ff688332b3b8ca75c228d291484e66e4a9
+    """
 
-    if branch:
-        branches = repo.remotes.origin.fetch(branch)
+    if skip_fetch:
+        branches = [branch] if branch else repo.heads
     else:
-        branches = repo.remotes.origin.fetch()
+        branches = [b.name for b in repo.remotes.origin.fetch(branch)]
 
-    for remote_branch in branches:
-        since_commit_reached = False
-        branch_name = remote_branch.name
-        prev_commit = None
+    for branch_name in branches:
+        first_commit_reached = False
+
         for curr_commit in repo.iter_commits(branch_name, max_count=max_depth):
-            commitHash = curr_commit.hexsha
-            if commitHash == since_commit:
-                since_commit_reached = True
-            if since_commit and since_commit_reached:
-                prev_commit = curr_commit
+            if first_commit:
+                if curr_commit.hexsha == first_commit:
+                    first_commit_reached = True
+                if not first_commit_reached:
+                    continue
+
+            if curr_commit.hexsha in already_searched or since_commit in already_searched:
                 continue
-            # if not prev_commit, then curr_commit is the newest commit. And we have nothing to diff with.
-            # But we will diff the first commit with NULL_TREE here to check the oldest code.
-            # In this way, no commit will be missed.
-            diff_hash = hashlib.md5((str(prev_commit) + str(curr_commit)).encode('utf-8')).digest()
-            if not prev_commit:
-                prev_commit = curr_commit
+            already_searched[curr_commit.hexsha] = True
+
+            print_err('====')
+            print_err('Current: ' + curr_commit.hexsha)
+
+            parent_count = len(curr_commit.parents)
+            if parent_count != 1:
+                print_err('{} parents found. Skipping'.format(parent_count))
                 continue
-            elif diff_hash in already_searched:
-                prev_commit = curr_commit
-                continue
-            else:
-                diff = curr_commit.diff(prev_commit, create_patch=True)
-            # avoid searching the same diffs
-            already_searched.add(diff_hash)
-            foundIssues = diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, path_inclusions, path_exclusions)
+
+            parent_commit, = curr_commit.parents
+
+            print_err('Parent: ' + parent_commit.hexsha)
+            print_err('Running: git diff ' + curr_commit.hexsha + ' ' + parent_commit.hexsha)
+            diff = parent_commit.diff(curr_commit, create_patch=True)
+            foundIssues = diff_worker(diff, curr_commit, branch_name, curr_commit.hexsha, custom_regexes,
+                                      do_entropy, do_regex, printJson, surpress_output, path_inclusions,
+                                      path_exclusions)
             output = handle_results(output, output_dir, foundIssues)
-            prev_commit = curr_commit
-        # Handling the first commit
-        diff = curr_commit.diff(NULL_TREE, create_patch=True)
-        foundIssues = diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, path_inclusions, path_exclusions)
-        output = handle_results(output, output_dir, foundIssues)
+
+            if curr_commit.hexsha == since_commit:
+                break
+
     output["project_path"] = project_path
     output["clone_uri"] = git_url
     output["issues_path"] = output_dir
     if not repo_path:
         shutil.rmtree(project_path, onerror=del_rw)
     return output
+
+def print_err(string):
+    # sys.stderr.write(string + "\n")
+    pass
+
 
 def clean_up(output):
     issues_path = output.get("issues_path", None)
